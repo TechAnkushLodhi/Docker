@@ -1,8 +1,9 @@
-version: '3.8'
-
 services:
   php:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: custom-php-magento:latest
     container_name: php84-container
     ports:
       - "9000:9000"
@@ -23,7 +24,132 @@ services:
       - php
     networks:
       - magento-network
+  mysql:
+    image: mysql:8.0
+    container_name: mysql-container
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: magento
+      MYSQL_USER: magento
+      MYSQL_PASSWORD: magentopass
+    command: --log-bin-trust-function-creators=1
+    ports:
+      - "3307:3306"
+    volumes:
+      - db-data:/var/lib/mysql
+    networks:
+      - magento-network
+    
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-prootpass"]
+      interval: 5s
+      timeout: 10s
+      retries: 6
 
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin
+    container_name: phpmyadmin-container
+    environment:
+      PMA_HOST: mysql
+      PMA_PORT: 3306
+      PMA_USER: magento
+      PMA_PASSWORD: magentopass
+    ports:
+      - "8081:80"
+    depends_on:
+      - mysql
+    networks:
+      - magento-network
+
+  opensearch:
+    image: opensearchproject/opensearch:2.17.0
+    container_name: opensearch-container
+    environment:
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+      - DISABLE_SECURITY_PLUGIN=true
+      
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+    networks:
+      - magento-network
+      
+  magento-install:
+    image: custom-php-magento:latest
+    container_name: magento-install-container
+    depends_on:
+      php:
+        condition: service_started
+      opensearch:
+        condition: service_started
+      mysql:
+        condition: service_healthy
+    volumes:
+      - ./src:/var/www/html
+    env_file:
+      - ./.env
+    entrypoint: >
+      sh -c '
+        if [ -f /var/www/html/app/etc/env.php ]; then
+            echo "✅ Magento already installed — skipping installation.";
+        else
+            echo "🚀 Starting Magento installation...";
+
+        # Configure composer authentication
+        composer config --global http-basic.repo.magento.com $MAGENTO_PUBLIC_KEY $MAGENTO_PRIVATE_KEY
+
+        # Install Magento
+        composer create-project --repository=https://repo.magento.com/ magento/project-community-edition=2.4.8-p3 /var/www/html --no-interaction --ignore-platform-reqs &&
+        
+        # Run Magento installation
+        #php /var/www/html/bin/magento setup:install \
+          --base-url="http://docker.localhost.com" \
+          --db-host="mysql" \
+          --db-name="magento" \
+          --db-user="magento" \
+          --db-password="magentopass" \
+          --admin-firstname="Admin" \
+          --admin-lastname="Admin" \
+          --admin-email="admin@example.com" \
+          --admin-user="admin" \
+          --admin-password="admin@123" \
+          --language="en_US" \
+          --currency="USD" \
+          --timezone="America/Chicago" \
+          --backend-frontname="admin_docker" \
+          --search-engine="opensearch" \
+          --opensearch-host="opensearch" \
+          --opensearch-port="9200" 
+
+        # Setup permissions
+        chown -R www-data:www-data /var/www/html 
+        find /var/www/html -type d -exec chmod 755 {} \;
+        find /var/www/html -type f -exec chmod 644 {} \;
+        chmod -R 775 var pub/static pub/media generated
+
+        # Magento setup commands
+        php bin/magento setup:upgrade
+        php bin/magento setup:di:compile
+        php bin/magento setup:static-content:deploy -f
+        php bin/magento cache:flush 
+        php bin/magento module:disable Magento_TwoFactorAuth Magento_AdminAdobeImsTwoFactorAuth
+
+      fi;
+
+      '
+    networks:
+      - magento-network
+
+      
 networks:
   magento-network:
     driver: bridge
+volumes:
+  db-data:
